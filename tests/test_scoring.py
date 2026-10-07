@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 import pandas as pd
 
-from scanner_engine import score_market
+from scanner_engine import RiskSettings, build_risk_plan, score_market
 
 
 class ScoreMarketTests(unittest.TestCase):
@@ -38,6 +38,36 @@ class ScoreMarketTests(unittest.TestCase):
         frame = self.make_frame()
         result = score_market(frame, frame.copy())
         self.assertIn(result["signal"], {"GÜÇLÜ AL", "AL", "NÖTR", "SAT", "GÜÇLÜ SAT"})
+
+    def test_stop_is_below_entry_when_available(self) -> None:
+        frame = self.make_frame()
+        result = score_market(frame, frame.copy())
+        self.assertGreater(float(result["stop_price"]), 0.0)
+        self.assertLess(float(result["stop_price"]), float(frame["close"].iloc[-1]))
+        self.assertGreater(float(result["stop_distance_pct"]), 0.0)
+
+    def test_risk_plan_respects_position_cap(self) -> None:
+        settings = RiskSettings(
+            account_balance=1000.0,
+            risk_per_trade_pct=0.5,
+            max_position_pct=20.0,
+            max_stop_pct=5.0,
+        )
+        plan = build_risk_plan(entry_price=100.0, stop_price=98.0, settings=settings)
+        self.assertTrue(plan["risk_ok"])
+        self.assertLessEqual(float(plan["position_usdt"]), 200.0)
+        self.assertLessEqual(float(plan["risk_at_stop_usdt"]), 5.0)
+
+    def test_risk_plan_rejects_wide_stop(self) -> None:
+        settings = RiskSettings(
+            account_balance=1000.0,
+            risk_per_trade_pct=0.5,
+            max_position_pct=20.0,
+            max_stop_pct=5.0,
+        )
+        plan = build_risk_plan(entry_price=100.0, stop_price=90.0, settings=settings)
+        self.assertFalse(plan["risk_ok"])
+        self.assertIn("STOP", str(plan["risk_reason"]))
 
     def test_requires_enough_history(self) -> None:
         frame = self.make_frame(rows=100)
