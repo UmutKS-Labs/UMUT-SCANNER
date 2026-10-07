@@ -1,0 +1,52 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - "*.py"
+      - "requirements.txt"
+      - "tests/**"
+      - ".github/workflows/build-windows.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install "pyinstaller>=6,<7"
+
+      - name: Run unit tests
+        shell: pwsh
+        run: python -m unittest discover -s tests -v
+
+      - name: Build UmutScanner.exe
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed --name UmutScanner app.py
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: UmutScanner-Windows
+          path: dist/UmutScanner.exe
+          if-no-files-found: error
+          retention-days: 30
