@@ -19,6 +19,14 @@ HIGHER_TF = {
 }
 
 
+@dataclass(frozen=True)
+class RiskSettings:
+    account_balance: float = 1000.0
+    risk_per_trade_pct: float = 0.5
+    max_position_pct: float = 20.0
+    max_stop_pct: float = 5.0
+
+
 @dataclass
 class ScanResult:
     symbol: str
@@ -37,6 +45,17 @@ class ScanResult:
     regime: str
     signal: str
     warning: str
+    atr: float
+    stop_price: float
+    stop_distance_pct: float
+    risk_budget_usdt: float
+    position_usdt: float
+    position_pct: float
+    risk_at_stop_usdt: float
+    technical_ok: bool
+    risk_ok: bool
+    trade_permission: str
+    reject_reason: str
 
 
 def clamp(value: float) -> float:
@@ -97,7 +116,6 @@ def confirmed_swings(frame: pd.DataFrame, window: int = 5) -> tuple[list[float],
     if len(frame) < window * 2 + 1:
         return swing_highs, swing_lows
 
-    # Symmetric confirmation: the latest `window` bars can never become a confirmed swing yet.
     for i in range(window, len(frame) - window):
         high_slice = highs[i - window : i + window + 1]
         low_slice = lows[i - window : i + window + 1]
@@ -108,7 +126,75 @@ def confirmed_swings(frame: pd.DataFrame, window: int = 5) -> tuple[list[float],
     return swing_highs, swing_lows
 
 
-def score_market(frame: pd.DataFrame, mtf_frame: pd.DataFrame) -> dict[str, float | str]:
+def calculate_stop(entry_price: float, atr_now: float, last_support: float | None) -> tuple[float, float]:
+    """Long/spot için ATR + teyitli destek tabanlı teknik stop önerisi."""
+    if entry_price <= 0 or atr_now <= 0:
+        return 0.0, 0.0
+
+    atr_stop = entry_price - 1.5 * atr_now
+    stop = atr_stop
+
+    if last_support is not None and np.isfinite(last_support) and 0 < last_support < entry_price:
+        support_distance_pct = (entry_price - float(last_support)) / entry_price * 100.0
+        if support_distance_pct <= 8.0:
+            structure_stop = float(last_support) - 0.20 * atr_now
+            stop = min(atr_stop, structure_stop)
+
+    stop = max(0.0, stop)
+    distance_pct = ((entry_price - stop) / entry_price * 100.0) if stop < entry_price else 0.0
+    return float(stop), float(distance_pct)
+
+
+def build_risk_plan(entry_price: float, stop_price: float, settings: RiskSettings) -> dict[str, float | bool | str]:
+    balance = max(0.0, float(settings.account_balance))
+    risk_pct = max(0.0, float(settings.risk_per_trade_pct))
+    max_position_pct = max(0.0, min(100.0, float(settings.max_position_pct)))
+    max_stop_pct = max(0.0, float(settings.max_stop_pct))
+
+    if entry_price <= 0 or stop_price <= 0 or stop_price >= entry_price:
+        return {
+            "risk_budget_usdt": 0.0,
+            "position_usdt": 0.0,
+            "position_pct": 0.0,
+            "risk_at_stop_usdt": 0.0,
+            "risk_ok": False,
+            "risk_reason": "STOP HESAPLANAMADI",
+        }
+
+    stop_fraction = (entry_price - stop_price) / entry_price
+    stop_pct = stop_fraction * 100.0
+    risk_budget = balance * risk_pct / 100.0
+    raw_position = risk_budget / stop_fraction if stop_fraction > 0 else 0.0
+    max_position_usdt = balance * max_position_pct / 100.0
+    position_usdt = min(raw_position, max_position_usdt, balance)
+    position_pct = (position_usdt / balance * 100.0) if balance > 0 else 0.0
+    risk_at_stop = position_usdt * stop_fraction
+
+    risk_ok = balance > 0 and risk_budget > 0 and position_usdt > 0 and 0 < stop_pct <= max_stop_pct
+    if balance <= 0:
+        reason = "BAKİYE GİR"
+    elif risk_budget <= 0:
+        reason = "RİSK % GİR"
+    elif stop_pct > max_stop_pct:
+        reason = f"STOP %{stop_pct:.2f} > LİMİT %{max_stop_pct:.2f}"
+    elif stop_pct <= 0:
+        reason = "STOP GEÇERSİZ"
+    elif position_usdt <= 0:
+        reason = "POZİSYON HESAPLANAMADI"
+    else:
+        reason = "UYGUN"
+
+    return {
+        "risk_budget_usdt": float(risk_budget),
+        "position_usdt": float(position_usdt),
+        "position_pct": float(position_pct),
+        "risk_at_stop_usdt": float(risk_at_stop),
+        "risk_ok": bool(risk_ok),
+        "risk_reason": reason,
+    }
+
+
+def score_market(frame: pd.DataFrame, mtf_frame: pd.DataFrame) -> dict[str, float | str | bool]:
     if len(frame) < 210 or len(mtf_frame) < 210:
         raise ValueError("Skor için en az 210 mum gerekir")
 
@@ -142,7 +228,6 @@ def score_market(frame: pd.DataFrame, mtf_frame: pd.DataFrame) -> dict[str, floa
     hist_now = float(macd_hist.iloc[-1]) if pd.notna(macd_hist.iloc[-1]) else 0.0
     hist_prev = float(macd_hist.iloc[-2]) if pd.notna(macd_hist.iloc[-2]) else 0.0
 
-    # Trend score
     trend = 50.0
     trend += 15.0 if last_close > e200 else -15.0
     if e20 > e50 > e200:
@@ -153,7 +238,6 @@ def score_market(frame: pd.DataFrame, mtf_frame: pd.DataFrame) -> dict[str, floa
     trend += 5.0 if ema50.iloc[-1] > ema50.iloc[-6] else -5.0
     trend = clamp(trend)
 
-    # Momentum score
     momentum = 50.0
     if 55 <= rsi_now <= 70:
         momentum += 15.0
@@ -173,7 +257,6 @@ def score_market(frame: pd.DataFrame, mtf_frame: pd.DataFrame) -> dict[str, floa
     momentum += 10.0 if roc_now > 0 else -10.0
     momentum = clamp(momentum)
 
-    # Relative-volume score
     up_bar = close.iloc[-1] >= close.iloc[-2]
     volume_score = 50.0
     if rvol >= 1.5:
@@ -186,7 +269,6 @@ def score_market(frame: pd.DataFrame, mtf_frame: pd.DataFrame) -> dict[str, floa
         volume_score -= 20.0
     volume_score = clamp(volume_score)
 
-    # Confirmed swing structure
     swing_highs, swing_lows = confirmed_swings(frame, 5)
     bull_structure = len(swing_highs) >= 2 and len(swing_lows) >= 2 and swing_highs[-1] > swing_highs[-2] and swing_lows[-1] > swing_lows[-2]
     bear_structure = len(swing_highs) >= 2 and len(swing_lows) >= 2 and swing_highs[-1] < swing_highs[-2] and swing_lows[-1] < swing_lows[-2]
@@ -203,12 +285,15 @@ def score_market(frame: pd.DataFrame, mtf_frame: pd.DataFrame) -> dict[str, floa
     structure_score = clamp(structure_score)
     structure = "HH/HL" if bull_structure else "LH/LL" if bear_structure else "KARMA"
 
-    # Higher timeframe confirmation
     mtf_close = mtf_frame["close"]
-    mtf_e20 = ema(mtf_close, 20).iloc[-1]
-    mtf_e50 = ema(mtf_close, 50).iloc[-1]
-    mtf_e200 = ema(mtf_close, 200).iloc[-1]
-    mtf_last = float(mtf_close.iloc[-1])
+    confirmed_mtf = mtf_close.iloc[:-1] if len(mtf_close) > 210 else mtf_close
+    mtf_e20_series = ema(confirmed_mtf, 20)
+    mtf_e50_series = ema(confirmed_mtf, 50)
+    mtf_e200_series = ema(confirmed_mtf, 200)
+    mtf_last = float(confirmed_mtf.iloc[-1])
+    mtf_e20 = float(mtf_e20_series.iloc[-1])
+    mtf_e50 = float(mtf_e50_series.iloc[-1])
+    mtf_e200 = float(mtf_e200_series.iloc[-1])
     if mtf_last > mtf_e200 and mtf_e20 > mtf_e50:
         mtf_score = 80.0
     elif mtf_last < mtf_e200 and mtf_e20 < mtf_e50:
@@ -216,7 +301,6 @@ def score_market(frame: pd.DataFrame, mtf_frame: pd.DataFrame) -> dict[str, floa
     else:
         mtf_score = 50.0
 
-    # Bollinger squeeze bonus
     basis = close.rolling(20, min_periods=20).mean()
     std = close.rolling(20, min_periods=20).std(ddof=0)
     upper = basis + 2.0 * std
@@ -302,6 +386,44 @@ def score_market(frame: pd.DataFrame, mtf_frame: pd.DataFrame) -> dict[str, floa
     else:
         warning = "NORMAL"
 
+    stop_price, stop_distance_pct = calculate_stop(
+        last_close,
+        atr_now,
+        float(last_support) if np.isfinite(last_support) else None,
+    )
+
+    technical_ok = (
+        trend >= 70
+        and setup >= 70
+        and entry >= 65
+        and general >= 72
+        and adx_now >= 20
+        and rvol >= 1.0
+        and mtf_score >= 50
+        and signal in {"AL", "GÜÇLÜ AL"}
+        and warning != "KOVALAMA RİSKİ"
+    )
+
+    technical_reasons: list[str] = []
+    if trend < 70:
+        technical_reasons.append("TREND<70")
+    if setup < 70:
+        technical_reasons.append("SETUP<70")
+    if entry < 65:
+        technical_reasons.append("ENTRY<65")
+    if general < 72:
+        technical_reasons.append("GENEL<72")
+    if adx_now < 20:
+        technical_reasons.append("ADX<20")
+    if rvol < 1.0:
+        technical_reasons.append("RVOL<1")
+    if mtf_score < 50:
+        technical_reasons.append("MTF ZAYIF")
+    if signal not in {"AL", "GÜÇLÜ AL"}:
+        technical_reasons.append("SİNYAL YETERSİZ")
+    if warning == "KOVALAMA RİSKİ":
+        technical_reasons.append("GİRİŞ UZAK")
+
     return {
         "trend_score": trend,
         "setup_score": setup,
@@ -315,6 +437,11 @@ def score_market(frame: pd.DataFrame, mtf_frame: pd.DataFrame) -> dict[str, floa
         "regime": regime,
         "signal": signal,
         "warning": warning,
+        "atr": atr_now,
+        "stop_price": stop_price,
+        "stop_distance_pct": stop_distance_pct,
+        "technical_ok": technical_ok,
+        "technical_reason": "UYGUN" if technical_ok else ", ".join(technical_reasons),
     }
 
 
@@ -323,12 +450,29 @@ class UmutScanner:
         self.client = client or BinancePublicClient()
         self.workers = max(1, min(workers, 10))
 
-    def _scan_one(self, ticker: dict, interval: str) -> ScanResult:
+    def _scan_one(self, ticker: dict, interval: str, risk_settings: RiskSettings) -> ScanResult:
         symbol = str(ticker["symbol"])
         higher_tf = HIGHER_TF.get(interval, "4h")
         frame = self.client.get_klines(symbol, interval, 260)
         mtf_frame = self.client.get_klines(symbol, higher_tf, 260)
         scored = score_market(frame, mtf_frame)
+
+        risk = build_risk_plan(
+            entry_price=float(ticker["last_price"]),
+            stop_price=float(scored["stop_price"]),
+            settings=risk_settings,
+        )
+        technical_ok = bool(scored["technical_ok"])
+        risk_ok = bool(risk["risk_ok"])
+        permission = "İZİN" if technical_ok and risk_ok else "RET"
+
+        reject_reasons: list[str] = []
+        if not technical_ok:
+            reject_reasons.append(str(scored["technical_reason"]))
+        if not risk_ok:
+            reject_reasons.append(str(risk["risk_reason"]))
+        reject_reason = "UYGUN" if permission == "İZİN" else " | ".join(reject_reasons)
+
         return ScanResult(
             symbol=symbol,
             price=float(ticker["last_price"]),
@@ -346,6 +490,17 @@ class UmutScanner:
             regime=str(scored["regime"]),
             signal=str(scored["signal"]),
             warning=str(scored["warning"]),
+            atr=float(scored["atr"]),
+            stop_price=float(scored["stop_price"]),
+            stop_distance_pct=float(scored["stop_distance_pct"]),
+            risk_budget_usdt=float(risk["risk_budget_usdt"]),
+            position_usdt=float(risk["position_usdt"]),
+            position_pct=float(risk["position_pct"]),
+            risk_at_stop_usdt=float(risk["risk_at_stop_usdt"]),
+            technical_ok=technical_ok,
+            risk_ok=risk_ok,
+            trade_permission=permission,
+            reject_reason=reject_reason,
         )
 
     def scan(
@@ -354,9 +509,11 @@ class UmutScanner:
         max_symbols: int = 60,
         min_quote_volume: float = 10_000_000.0,
         min_score: float = 0.0,
+        risk_settings: RiskSettings | None = None,
         progress: Callable[[int, int, str, ScanResult | None, str | None], None] | None = None,
         cancel_event: Event | None = None,
     ) -> tuple[list[ScanResult], int]:
+        settings = risk_settings or RiskSettings()
         universe = self.client.get_ranked_usdt_universe(max_symbols, min_quote_volume)
         total = len(universe)
         if total == 0:
@@ -365,7 +522,10 @@ class UmutScanner:
         results: list[ScanResult] = []
         errors = 0
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            futures = {pool.submit(self._scan_one, ticker, interval): ticker["symbol"] for ticker in universe}
+            futures = {
+                pool.submit(self._scan_one, ticker, interval, settings): ticker["symbol"]
+                for ticker in universe
+            }
             done = 0
             for future in as_completed(futures):
                 if cancel_event is not None and cancel_event.is_set():
@@ -388,5 +548,8 @@ class UmutScanner:
                 if progress is not None:
                     progress(done, total, symbol, result, error_text)
 
-        results.sort(key=lambda x: x.general_score, reverse=True)
+        results.sort(
+            key=lambda x: (x.trade_permission == "İZİN", x.general_score, x.entry_score),
+            reverse=True,
+        )
         return results, errors
